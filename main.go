@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	gocontext "context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -13,86 +15,92 @@ import (
 	"github.com/goreleaser/goreleaser/context"
 	"github.com/goreleaser/goreleaser/pipeline/defaults"
 	"github.com/gorilla/mux"
+	"github.com/pkg/errors"
 )
 
 func init() {
 	log.SetHandler(logfmt.Default)
 }
 
+func resolveTag(owner, repo, version string) (string, error) {
+	url := fmt.Sprintf("https://github.com/%s/%s/releases/%s", owner, repo, version)
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", errors.Wrap(err, "couldn't resolve tag")
+	}
+	parts := strings.Split(resp.Request.URL.String(), "/")
+	return parts[len(parts)-1], nil
+}
+
+func generateShell(ctx gocontext.Context, owner, repo, version string) (string, error) {
+	tag, err := resolveTag(owner, repo, version)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to get tag")
+	}
+	log.Infof("hi %s/%s @ %s (%s)", owner, repo, version, tag)
+
+	for _, f := range []string{
+		".goreleaser.yaml",
+		".goreleaser.yml",
+		"goreleaser.yaml",
+		"goreleaser.yml",
+	} {
+		url := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s/%s", owner, repo, tag, f)
+		resp, err := http.Get(url)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to get goreleaser yaml file")
+		}
+		if resp.StatusCode != 200 {
+			continue
+		}
+		defer resp.Body.Close()
+		proj, err := config.LoadReader(resp.Body)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to read response body")
+		}
+		// avoid defauls pipe trying to use git if there is not a
+		// project setup on the goreleaser file.
+		if proj.Release.GitHub.Name == "" {
+			proj.Release.GitHub = config.Repo{
+				Name:  repo,
+				Owner: owner,
+			}
+		}
+		ctx := context.Wrap(ctx, proj)
+		pipe := defaults.Pipe{}
+		if err := pipe.Run(ctx); err != nil {
+			return "", errors.Wrap(err, "failed to set defaults on goreleaser file")
+		}
+		var out bytes.Buffer
+		err = template.Must(template.New("shell").Parse(shellGodownloader)).
+			Execute(&out, ctx.Config)
+		return out.String(), errors.Wrap(err, "failed to generate shell")
+	}
+	return "", fmt.Errorf("repository %s/%s does not use goreleaser", owner, repo)
+}
+
 func main() {
 	r := mux.NewRouter()
 
-	r.HandleFunc("/{org}/{repo}@{version}", func(w http.ResponseWriter, r *http.Request) {
+	r.HandleFunc("/{owner}/{repo}@{version}", func(w http.ResponseWriter, r *http.Request) {
 		v := mux.Vars(r)
-		repo := v["org"] + "/" + v["repo"]
+		owner := v["owner"]
+		repo := v["repo"]
 		version := v["version"]
-
-		resp, err := http.Get(fmt.Sprintf("https://github.com/%s/releases/%s", repo, version))
+		shell, err := generateShell(r.Context(), owner, repo, version)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		// the url after the redirect will be something like
-		// https://github.com/goreleaser/goreleaser/releases/v0.44.0
-		// so we remove "https://github.com/goreleaser/goreleaser/releases/"
-		// from that to keep the real tag only
-		tag := strings.Replace(
-			resp.Request.URL.String(),
-			fmt.Sprintf("https://github.com/%s/releases/", repo),
-			"",
-			1,
-		)
-		log.Infof("hi %s @ %s", repo, version)
-
-		for _, f := range []string{
-			".goreleaser.yaml",
-			".goreleaser.yml",
-			"goreleaser.yaml",
-			"goreleaser.yml",
-		} {
-			url := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s", repo, tag, f)
-			resp, err := http.Get(url)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			if resp.StatusCode != 200 {
-				continue
-			}
-			defer resp.Body.Close()
-			proj, err := config.LoadReader(resp.Body)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			// avoid defauls pipe trying to use git if there is not a
-			// project setup on the goreleaser file.
-			if proj.Release.GitHub.Name == "" {
-				proj.Release.GitHub = config.Repo{
-					Name:  v["repo"],
-					Owner: v["owner"],
-				}
-			}
-			pipe := defaults.Pipe{}
-			if err := pipe.Run(context.Wrap(r.Context(), proj)); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			if err := template.Must(template.New("shell").Parse(shellGodownloader)).Execute(w, proj); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			return
-		}
-		http.Error(w, "repository does not use goreleaser", http.StatusBadRequest)
+		fmt.Fprintln(w, shell)
 	})
-	r.HandleFunc("/{org}/{repo}", func(w http.ResponseWriter, r *http.Request) {
+	r.HandleFunc("/{owner}/{repo}", func(w http.ResponseWriter, r *http.Request) {
 		v := mux.Vars(r)
-		url := fmt.Sprintf("/%s/%s@latest", v["org"], v["repo"])
+		url := fmt.Sprintf("/%s/%s@latest", v["owner"], v["repo"])
 		http.Redirect(w, r, url, http.StatusPermanentRedirect)
 	})
 
+	log.Info("started up")
 	if err := http.ListenAndServe(":8080", httplog.New(r)); err != nil {
 		log.Fatal(err.Error())
 	}
